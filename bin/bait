@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# bait - disposable honeypot VM session: clone -> boot -> VPN-bind -> record -> teardown
+# Usage: bait doctor | setup | start | status | clean | persona
+set -Eeuo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+[[ $EUID -eq 0 ]] || exec sudo "$SELF" "$@"          # self-elevate: one command, no manual sudo
+
+PROJECT="${PROJECT:-$(dirname "$(dirname "$SELF")")}"
+[[ -r "$PROJECT/config/bait.env" ]] && . "$PROJECT/config/bait.env"
+
+# ---------- config (override in config/bait.env) ----------
+GOLDEN="${GOLDEN:-/var/lib/libvirt/images/golden-win.qcow2}"
+OVERLAY_DIR="${OVERLAY_DIR:-/var/lib/libvirt/images/bait-sessions}"
+SESSIONS="${SESSIONS:-$PROJECT/sessions}"
+VPN_IF="${VPN_IF:-auto}"
+DNS_UPSTREAM="${DNS_UPSTREAM:-9.9.9.9}"
+NET="bait-net"; BR="virbr-bait"; SUBNET="192.168.77"
+VCPUS="${VCPUS:-4}"; RAM_MB="${RAM_MB:-6144}"; OSINFO="${OSINFO:-win10}"
+EXTRA_VIRT_INSTALL="${EXTRA_VIRT_INSTALL:-}"
+KEEP_DISK="${KEEP_DISK:-0}"
+U="${SUDO_USER:-root}"
+export LIBVIRT_DEFAULT_URI="qemu:///system"
+
+SID="$(date +%Y%m%d-%H%M%S)-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+DIR="$SESSIONS/$SID"; OVERLAY="$OVERLAY_DIR/$SID.qcow2"; DOM="bait-$SID"
+EXIT_IP=""; TCPDUMP_PID=""; TORN=0
+
+log() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+as_user() { sudo -u "$U" env XDG_RUNTIME_DIR="/run/user/$(id -u "$U")" \
+            WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" DISPLAY="${DISPLAY:-:0}" "$@"; }
+obs() { command -v obs-cmd &>/dev/null && as_user obs-cmd "$@" || true; }
+
+# ---------- VPN detection ----------
+route_dev() { ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1; }
+detect_vpn() {
+  local dev d; dev="$(route_dev)"
+  [[ -n "$dev" ]] || die "no route to internet"
+  d="$(ip -d link show "$dev")"
+  [[ "$d" == *wireguard* || "$d" == *"tun type"* || "$d" == *" tun "* ]] \
+    || die "default route uses '$dev', which is not a tunnel. Connect your VPN first."
+  echo "$dev"
+}
+
+# ---------- isolated libvirt NAT network pinned to the tunnel ----------
+ensure_net() {
+  if virsh net-info "$NET" &>/dev/null; then
+    local cur; cur="$(virsh net-dumpxml "$NET")"
+    if [[ "$cur" == *"dev='$VPN_IF'"* ]]; then virsh net-start "$NET" &>/dev/null || true; return; fi
+    log "tunnel interface changed -> redefining $NET"
+    virsh net-destroy "$NET" &>/dev/null || true
+    virsh net-undefine "$NET" >/dev/null
+  fi
+  local xml; xml="$(mktemp)"
+  cat > "$xml" <<XML
+<network xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'>
+  <name>$NET</name>
+  <forward mode='nat' dev='$VPN_IF'/>
+  <bridge name='$BR' stp='off' delay='0'/>
+  <ip address='$SUBNET.1' netmask='255.255.255.0'>
+    <dhcp><range start='$SUBNET.100' end='$SUBNET.150'/></dhcp>
+  </ip>
+  <dnsmasq:options>
+    <dnsmasq:option value='dhcp-option=6,$DNS_UPSTREAM'/>
+  </dnsmasq:options>
+</network>
+XML
+  virsh net-define "$xml" >/dev/null; rm -f "$xml"
+  virsh net-start "$NET" >/dev/null
+  log "network $NET defined (egress pinned to $VPN_IF)"
+}
+
+# ---------- fail-closed firewall (atomic) ----------
+guard_up() {
+  nft delete table inet baitguard 2>/dev/null || true
+  nft -f - <<NFT
+table inet baitguard {
+  chain fwd {
+    type filter hook forward priority -10; policy accept;
+    iifname "$BR" oifname != "$VPN_IF" drop
+    iifname "$BR" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
+    iifname "$BR" tcp dport { 22, 23, 25, 135, 139, 445, 3389, 5900 } drop
+    iifname "$BR" ct state new limit rate over 200/second drop
+  }
+  chain in {
+    type filter hook input priority -10; policy accept;
+    iifname "$BR" udp dport 67 accept
+    iifname "$BR" drop
+  }
+}
+NFT
+  log "kill-switch rules active"
+}
+guard_down() { nft delete table inet baitguard 2>/dev/null || true; }
+
+# ---------- preflight ----------
+preflight() {
+  for c in virsh virt-install qemu-img nft tcpdump curl ip sed; do
+    command -v "$c" &>/dev/null || die "missing command: $c (run: bait doctor)"
+  done
+  [[ -f "$GOLDEN" ]] || die "golden image missing: $GOLDEN"
+  [[ "$VPN_IF" == auto ]] && VPN_IF="$(detect_vpn)"
+  ip link show "$VPN_IF" up &>/dev/null || die "VPN interface $VPN_IF is down"
+  [[ "$(route_dev)" == "$VPN_IF" ]] || die "default route is NOT via $VPN_IF (leak risk)"
+  EXIT_IP="$(curl -fsS --max-time 8 --interface "$VPN_IF" https://ifconfig.me || true)"
+  [[ -n "$EXIT_IP" ]] || die "could not determine VPN exit IP"
+  log "tunnel: $VPN_IF  exit IP: $EXIT_IP"
+}
+
+# ---------- teardown (runs once, always) ----------
+teardown() {
+  set +e; [[ $TORN -eq 1 ]] && return; TORN=1
+  log "tearing down $SID"
+  obs recording stop
+  [[ -n "$TCPDUMP_PID" ]] && { kill "$TCPDUMP_PID" 2>/dev/null; wait "$TCPDUMP_PID" 2>/dev/null; }
+  virsh destroy "$DOM" &>/dev/null
+  if [[ -f "$OVERLAY" ]]; then
+    if [[ "$KEEP_DISK" == "1" ]]; then
+      mkdir -p "$PROJECT/quarantine" && mv "$OVERLAY" "$PROJECT/quarantine/$SID.qcow2"
+      chmod 000 "$PROJECT/quarantine/$SID.qcow2"
+      log "overlay quarantined (never boot outside an isolated lab)"
+    else
+      rm -f "$OVERLAY"
+    fi
+  fi
+  guard_down
+  [[ -d "$DIR" ]] || return
+  printf '{"session":"%s","vpn_if":"%s","vpn_exit_ip":"%s","ended":"%s"}\n' \
+    "$SID" "$VPN_IF" "$EXIT_IP" "$(date -Is)" > "$DIR/session.json"
+  ( cd "$DIR" && sha256sum capture.pcap notes.md session.json persona.json 2>/dev/null > SHA256SUMS )
+  chown -R "$U": "$DIR" 2>/dev/null
+  log "done. evidence in $DIR"
+}
+
+# ---------- session ----------
+start() {
+  preflight; ensure_net
+  mkdir -p "$DIR" "$OVERLAY_DIR"; chmod 700 "$DIR"
+  trap teardown EXIT; trap 'exit 130' INT TERM
+  [[ -f "$PROJECT/persona/persona.json" ]] && cp "$PROJECT/persona/persona.json" "$DIR/"
+
+  qemu-img create -q -f qcow2 -F qcow2 -b "$GOLDEN" "$OVERLAY"
+  guard_up
+  tcpdump -nn -i "$BR" -U -w "$DIR/capture.pcap" 2>"$DIR/tcpdump.log" & TCPDUMP_PID=$!
+
+  local extra=(); read -ra extra <<<"$EXTRA_VIRT_INSTALL"
+  virt-install --name "$DOM" --transient --import --noautoconsole \
+    --vcpus "$VCPUS" --memory "$RAM_MB" --cpu host-passthrough --osinfo "$OSINFO" \
+    --clock offset=localtime \
+    --disk "path=$OVERLAY,bus=sata" \
+    --network "network=$NET,model=e1000e" \
+    --graphics spice,clipboard.copypaste=off,filetransfer.enable=off --video qxl \
+    "${extra[@]}"
+  log "VM $DOM booted"
+
+  obs recording start
+  command -v virt-viewer &>/dev/null && as_user virt-viewer -c qemu:///system "$DOM" &>/dev/null &
+
+  touch "$DIR/notes.md"
+  log "SESSION LIVE. Log numbers/IDs/URLs in $DIR/notes.md. Enter = end & destroy."
+  local rc
+  while virsh domstate "$DOM" 2>/dev/null | grep -q running; do
+    rc=0; read -r -t 3 || rc=$?
+    (( rc < 128 )) && break
+  done
+}
+
+# ---------- helpers ----------
+doctor() {
+  local ok=1 c
+  for c in virsh virt-install qemu-img nft tcpdump curl virt-viewer obs-cmd; do
+    if command -v "$c" &>/dev/null; then log "ok      $c"; else log "MISSING $c"; ok=0; fi
+  done
+  if [[ -f "$GOLDEN" ]]; then log "ok      golden: $GOLDEN"; else log "MISSING golden: $GOLDEN"; ok=0; fi
+  if [[ -f "$GOLDEN" && "$(stat -c %A "$GOLDEN")" == *w* ]]; then log "WARN    golden is writable -> chmod a-w $GOLDEN"; fi
+  log "tunnel  $( (detect_vpn) 2>&1 )"
+  (( ok )) || log "run ./install.sh for dependencies (obs-cmd is optional: cargo install obs-cmd)"
+}
+
+persona() {
+  local f=(Margaret Dorothy Harold Walter Patricia Raymond Gloria Eugene)
+  local l=(Hollis Bennett Whitaker Kowalski Dunning Pruitt Lindqvist Ostrander)
+  local c=("Omaha, NE|Central Standard Time" "Tulsa, OK|Central Standard Time" "Dayton, OH|Eastern Standard Time" "Boise, ID|Mountain Standard Time")
+  local pick="${c[RANDOM % ${#c[@]}]}"
+  local first="${f[RANDOM % ${#f[@]}]}" last="${l[RANDOM % ${#l[@]}]}" city="${pick%%|*}" tz="${pick##*|}"
+  local age=$((66 + RANDOM % 14)) bal=$((9000 + RANDOM % 30000)) bank="Prairie Mutual Credit Union"
+  mkdir -p "$PROJECT/persona"
+  cat > "$PROJECT/persona/persona.json" <<JSON
+{"first":"$first","last":"$last","age":$age,"city":"$city","tz":"$tz","bank":"$bank","balance":$bal,
+ "quirks":["hard of hearing: ask them to repeat","types slowly with two fingers","calls the computer 'the machine'","grandson set it all up"]}
+JSON
+  cat "$PROJECT/persona/persona.json"
+  echo; echo "Inside golden VM (admin PowerShell):"
+  echo ".\\seed.ps1 -First '$first' -Last '$last' -City '$city' -Tz '$tz' -Bank '$bank' -Balance $bal"
+}
+
+clean() { guard_down; virsh net-destroy "$NET" &>/dev/null || true; log "guard removed, $NET stopped"; }
+
+case "${1:-start}" in
+  doctor)  doctor ;;
+  setup)   preflight; ensure_net; chmod a-w "$GOLDEN"; log "ready. golden set read-only." ;;
+  start)   start ;;
+  status)  virsh list --all; nft list table inet baitguard 2>/dev/null || echo "guard not active" ;;
+  clean)   clean ;;
+  persona) persona ;;
+  *) die "usage: bait doctor|setup|start|status|clean|persona" ;;
+esac
